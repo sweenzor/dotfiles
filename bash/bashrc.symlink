@@ -6,8 +6,8 @@ export LSCOLORS=ExFxBxDxCxegedabagacad
 export EDITOR=vim
 
 # Git completions
-source /usr/local/Cellar/git/2.22.0_1/etc/bash_completion.d/git-completion.bash
-source /usr/local/Cellar/git/2.22.0_1/etc/bash_completion.d/git-prompt.sh
+source /usr/local/Cellar/git/2.30.0/etc/bash_completion.d/git-completion.bash
+source /usr/local/Cellar/git/2.30.0/etc/bash_completion.d/git-prompt.sh
 
 # Maximum number of history lines in memory
 export HISTSIZE=50000
@@ -23,7 +23,6 @@ export PATH=/usr/local/bin:$PATH
 
 # Python, pipenv
 export PATH="/usr/local/opt/python/libexec/bin:$PATH"
-export PATH="/Users/sweeney/Library/Python/3.7/bin:$PATH"
 
 # Ignore macOS Catalina bash deprecation warning
 export BASH_SILENCE_DEPRECATION_WARNING=1
@@ -34,3 +33,5 @@ wallcat() {
     dest=~/Dropbox/Graphics/wallcat
     ls -q1 $source | tail -1 | xargs -I{} cp -v $source/{} $dest/{}.jpg
 }
+
+[ -f ~/.fzf.bash ] && source ~/.fzf.bash
