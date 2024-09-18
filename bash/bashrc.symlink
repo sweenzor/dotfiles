@@ -6,8 +6,8 @@ export LSCOLORS=ExFxBxDxCxegedabagacad
 export EDITOR=vim
 
 # Git completions
-source /usr/local/Cellar/git/2.30.0/etc/bash_completion.d/git-completion.bash
-source /usr/local/Cellar/git/2.30.0/etc/bash_completion.d/git-prompt.sh
+source /usr/local/Cellar/git/2.46.1/etc/bash_completion.d/git-completion.bash
+source /usr/local/Cellar/git/2.46.1/etc/bash_completion.d/git-prompt.sh
 
 # Maximum number of history lines in memory
 export HISTSIZE=50000
