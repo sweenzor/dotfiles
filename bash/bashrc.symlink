@@ -27,11 +27,8 @@ export PATH="/usr/local/opt/python/libexec/bin:$PATH"
 # Ignore macOS Catalina bash deprecation warning
 export BASH_SILENCE_DEPRECATION_WARNING=1
 
-# Save current wallcat background
-wallcat() {
-    source=~/Library/Containers/cat.wall.Wallcat/Data/downloadedImages
-    dest=~/Dropbox/Graphics/wallcat
-    ls -q1 $source | tail -1 | xargs -I{} cp -v $source/{} $dest/{}.jpg
-}
-
+# fzf, a general-purpose command-line fuzzy finder
 [ -f ~/.fzf.bash ] && source ~/.fzf.bash
+
+# Alias to (local) Claude Code
+alias claude="/Users/sweeney/.claude/local/claude"
