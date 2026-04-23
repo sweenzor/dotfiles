@@ -1,10 +1,11 @@
-# list of things to to install from homebrew
+#!/usr/bin/env bash
+#
+# List of things to install from homebrew
+set -e
 
-# tmux and friends
+# Tmux and friends
 brew install tmux
-brew install reattach-to-user-namespace
 
-# utils
+# Utils
 brew install tig
 brew install htop
-brew install vit

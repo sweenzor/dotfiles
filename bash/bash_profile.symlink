@@ -1,6 +1,9 @@
 # ARM Homebrew setup
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
+# Local binaries
+export PATH="$HOME/.local/bin:$PATH"
+
 # Load .bashrc if it exists
 test -f ~/.bashrc && source ~/.bashrc
 

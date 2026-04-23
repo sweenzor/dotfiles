@@ -23,6 +23,3 @@ export BASH_SILENCE_DEPRECATION_WARNING=1
 
 # fzf, a general-purpose command-line fuzzy finder
 [ -f ~/.fzf.bash ] && source ~/.fzf.bash
-
-# Alias to (local) Claude Code
-export PATH="$HOME/.local/bin:$PATH"

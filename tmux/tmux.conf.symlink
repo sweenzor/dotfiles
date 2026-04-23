@@ -15,7 +15,6 @@ set-option -g renumber-windows on
 
 # Show colors
 set-option -g default-terminal "screen-256color"
-set-window-option -g utf8 on
 
 # ----------------------------------------------------------------------------
 # Interaction
@@ -26,17 +25,12 @@ setw -g mode-keys vi
 set -g status-keys vi
 
 # Copy like vim
-bind-key -t vi-copy 'v' begin-selection
-bind-key -t vi-copy 'y' copy-selection
+bind-key -T copy-mode-vi 'v' send-keys -X begin-selection
+bind-key -T copy-mode-vi 'y' send-keys -X copy-selection
 
-setw -g mode-mouse on
-set-option -g mouse-select-pane on
+set -g mouse on
 
-set -g mouse-resize-pane on
-set -g mouse-select-pane on
-set -g mouse-select-window on
-
-set -g pane-active-border-fg blue
+set -g pane-active-border-style fg=blue
 
 # ----------------------------------------------------------------------------
 # Key Bindings
