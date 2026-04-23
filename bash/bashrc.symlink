@@ -1,6 +1,6 @@
 # Bash terminal style
 export PS1='\[\033[36m\]\u\[\033[m\]@\[\033[32m\]\h:\
-\[\033[33;1m\]\w\[\033[m\]$(__git_ps1 "(%s)")\[\033[35m\]${GWS_ACCOUNT:+ [gws:$GWS_ACCOUNT]}\[\033[m\]\$ '
+\[\033[33;1m\]\w\[\033[m\]$(__git_ps1 "(%s)")\[\033[35m\]${GWS_ACCOUNT:+[gws:$GWS_ACCOUNT]}\[\033[m\]\$ '
 export CLICOLOR=1
 export LSCOLORS=ExFxBxDxCxegedabagacad
 export EDITOR=vim
@@ -62,6 +62,15 @@ gws() {
         return 1
     fi
 
-    echo "[gws: $account]" >&2
+    local email_cache="$config_dir/.email" email
+    if [ -f "$email_cache" ]; then
+        email=$(cat "$email_cache")
+    else
+        email=$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" command gws auth status 2>/dev/null \
+                | sed -nE 's/.*"user": *"([^"]+)".*/\1/p')
+        [ -n "$email" ] && echo "$email" > "$email_cache"
+    fi
+
+    echo "Using account ${email:-$account} with credentials loaded from $config_dir" >&2
     GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" command gws "${args[@]}"
 }
