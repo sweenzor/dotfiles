@@ -1,1 +1,15 @@
 vim/vim.symlink/.netrwhist
+
+# Defensive: never commit secrets
+*.env
+.env*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.aws/
+.ssh/
+.netrc
+.npmrc
+.pypirc
