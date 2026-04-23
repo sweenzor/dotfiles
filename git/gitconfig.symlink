@@ -1,5 +1,5 @@
 [user]
-    name = Matt Sweeney
+    name = Matthew Sweeney
     email = mattswe@gmail.com
 
 [includeIf "gitdir:~/src/"]
