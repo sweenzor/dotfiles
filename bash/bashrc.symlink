@@ -71,6 +71,8 @@ gws() {
         [ -n "$email" ] && echo "$email" > "$email_cache"
     fi
 
-    echo "Using account ${email:-$account} with credentials loaded from $config_dir" >&2
+    local display_dir="${config_dir/#$HOME/~}"
+    printf '\033[35m▸ gws\033[0m using account \033[1m%s\033[0m\n  credentials: %s\n\n' \
+        "${email:-$account}" "$display_dir" >&2
     GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" command gws "${args[@]}"
 }
