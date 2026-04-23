@@ -1,6 +1,6 @@
 # Bash terminal style
 export PS1='\[\033[36m\]\u\[\033[m\]@\[\033[32m\]\h:\
-\[\033[33;1m\]\w\[\033[m\]$(__git_ps1 "(%s)")\$ '
+\[\033[33;1m\]\w\[\033[m\]$(__git_ps1 "(%s)")\[\033[35m\]${GWS_ACCOUNT:+ [gws:$GWS_ACCOUNT]}\[\033[m\]\$ '
 export CLICOLOR=1
 export LSCOLORS=ExFxBxDxCxegedabagacad
 export EDITOR=vim
@@ -23,3 +23,45 @@ export BASH_SILENCE_DEPRECATION_WARNING=1
 
 # fzf, a general-purpose command-line fuzzy finder
 [ -f ~/.fzf.bash ] && source ~/.fzf.bash
+
+# gws (Google Workspace CLI) multi-account wrapper
+export GWS_ACCOUNTS_DIR="$HOME/.config/gws/accounts"
+
+gws() {
+    local switch=false one_shot="" args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --switch)  switch=true; shift ;;
+            --account) one_shot="$2"; shift 2 ;;
+            *)         args+=("$1"); shift ;;
+        esac
+    done
+
+    if [ ! -d "$GWS_ACCOUNTS_DIR" ] || [ -z "$(ls -A "$GWS_ACCOUNTS_DIR" 2>/dev/null)" ]; then
+        echo "gws: no accounts configured in $GWS_ACCOUNTS_DIR" >&2
+        echo "To set one up:" >&2
+        echo "  mkdir -p $GWS_ACCOUNTS_DIR/<name>" >&2
+        echo "  GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$GWS_ACCOUNTS_DIR/<name> command gws auth login" >&2
+        return 1
+    fi
+
+    local account="$one_shot"
+    if [ -z "$account" ]; then
+        if [ "$switch" = true ] || [ -z "$GWS_ACCOUNT" ]; then
+            account=$(ls "$GWS_ACCOUNTS_DIR" | fzf --prompt="gws account> " --height=~10) || return 1
+            export GWS_ACCOUNT="$account"
+        else
+            account="$GWS_ACCOUNT"
+        fi
+    fi
+
+    local config_dir="$GWS_ACCOUNTS_DIR/$account"
+    if [ ! -d "$config_dir" ]; then
+        echo "gws: no config directory for account '$account' at $config_dir" >&2
+        echo "To set it up: GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$config_dir command gws auth login" >&2
+        return 1
+    fi
+
+    echo "[gws: $account]" >&2
+    GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" command gws "${args[@]}"
+}
