@@ -14,7 +14,7 @@ though.
 
 ## thanks
 
-Forked from [Holman](http://github.com/holman):
+Forked from [Holman](http://github.com/holman/dotfiles):
 > I forked [Ryan Bates](http://github.com/ryanb)' excellent
 [dotfiles](http://github.com/ryanb/dotfiles) for a couple years before the
 weight of my changes and tweaks inspired me to finally roll my own. But Ryan's
