@@ -25,7 +25,8 @@ export BASH_SILENCE_DEPRECATION_WARNING=1
 [ -f ~/.fzf.bash ] && source ~/.fzf.bash
 
 # gws (Google Workspace CLI) multi-account wrapper
-GWS_ACCOUNTS_DIR="$HOME/.config/gws/accounts"
+# Exported so non-interactive shells (e.g. Claude Code) resolve accounts too.
+export GWS_ACCOUNTS_DIR="$HOME/.config/gws/accounts"
 
 gws() {
     local switch=false one_shot="" args=()
@@ -59,6 +60,12 @@ gws() {
 
     local account="$one_shot"
     if [ -z "$account" ]; then
+        # Non-interactive: no fzf, and don't trust an inherited sticky
+        # GWS_ACCOUNT — identity must be explicit in scripts.
+        if [ ! -t 0 ]; then
+            echo "gws: non-interactive shell — use --account <name> (one of: ${entries[*]})" >&2
+            return 2
+        fi
         if [ "$switch" = true ] || [ -z "$GWS_ACCOUNT" ]; then
             account=$(printf '%s\n' "${entries[@]}" | fzf --prompt="gws account> " --height=~10) || return 1
             export GWS_ACCOUNT="$account"
