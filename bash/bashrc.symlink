@@ -96,3 +96,7 @@ gws() {
         "${email:-$account}" "${config_dir/#$HOME/~}" >&2
     GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" command gws "${args[@]}"
 }
+
+# OrbStack (no admin helper)
+export PATH="$HOME/.orbstack/bin:$PATH"
+export DOCKER_HOST="unix://$HOME/.orbstack/run/docker.sock"
