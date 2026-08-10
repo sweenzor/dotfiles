@@ -109,6 +109,52 @@ link_one () {
   fi
 }
 
+# <flat $HOME path>:<the config/ path that replaced it>
+#
+# Leaving a migrated flat link behind is not harmless, and each tool fails
+# differently: git reads ~/.gitconfig on top of the XDG file and wins key by
+# key, tmux loads both configs additively, and ~/.vimrc shadows
+# ~/.config/vim/vimrc outright.
+LEGACY_LINKS="
+.gitconfig:git/config
+.gitignore:git/ignore
+.tmux.conf:tmux/tmux.conf
+.vimrc:vim/vimrc
+.vim:vim
+"
+
+# Only ever unlinks symlinks that resolve back into this repo. A real file, or
+# a link to somewhere else, belongs to the user and is left alone.
+prune_legacy_links () {
+  info 'pruning legacy links'
+
+  local entry name replacement dest target
+
+  for entry in $LEGACY_LINKS
+  do
+    name="${entry%%:*}"
+    replacement="${entry#*:}"
+
+    # Nothing has replaced this yet, so the flat link is still the live one.
+    # Pruning here would just fight install_dotfiles, which would relink it
+    # from the *.symlink source on the very same run.
+    [ -e "$DOTFILES_ROOT/config/$replacement" ] || continue
+
+    dest="$HOME/$name"
+
+    [ -L "$dest" ] || continue
+    target="`readlink \"$dest\"`"
+
+    case "$target" in
+      "$DOTFILES_ROOT"/*)
+        rm "$dest"
+        success "unlinked stale $dest";;
+    esac
+  done
+
+  clear_line
+}
+
 # <topic>/<name>.symlink -> ~/.<name>
 install_dotfiles () {
   info 'installing dotfiles'
@@ -124,7 +170,34 @@ install_dotfiles () {
   clear_line
 }
 
+# config/<path> -> $XDG_CONFIG_HOME/<path>, recursively. Files are linked
+# individually rather than linking whole directories, so that a tool writing
+# its own state next to a config file does not end up writing into this repo.
+install_config () {
+  info 'installing config'
+
+  local root="$DOTFILES_ROOT/config"
+  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}"
+  local source dest
+
+  if [ ! -d "$root" ]
+  then
+    clear_line
+    return
+  fi
+
+  for source in `find $root -type f`
+  do
+    dest="$xdg/${source#$root/}"
+    link_one "$source" "$dest"
+  done
+
+  clear_line
+}
+
+prune_legacy_links
 install_dotfiles
+install_config
 
 echo ''
 echo '  All installed!'
