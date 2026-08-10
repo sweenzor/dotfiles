@@ -26,76 +26,102 @@ fail () {
   exit
 }
 
+# Wipes the current line. Each pass prints a banner with no trailing newline,
+# on the assumption that the first success() will overwrite it. When a pass has
+# nothing to do there is no success() to do that, so it clears its own banner.
+clear_line () {
+  printf "\r\033[2K"
+}
+
 link_files () {
-  ln -s $1 $2
+  mkdir -p "`dirname \"$2\"`"
+  ln -s "$1" "$2"
   success "linked $1 to $2"
 }
 
+# Answers to the overwrite/backup/skip prompt. Global so that an "all" answer
+# given once applies to every pass for the rest of the run.
+overwrite_all=false
+backup_all=false
+skip_all=false
+
+# Links one source to one destination, prompting if something is already there.
+link_one () {
+  local source="$1"
+  local dest="$2"
+  local overwrite=false backup=false skip=false action
+
+  # Already pointing where we want it: do nothing and say nothing. Re-running
+  # bootstrap should be quiet.
+  if [ -L "$dest" ] && [ "`readlink \"$dest\"`" = "$source" ]
+  then
+    return
+  fi
+
+  # -e answers "is there something here?" for real files and for symlinks that
+  # resolve, but reports false on a broken symlink -- hence the -L as well.
+  if [ ! -e "$dest" ] && [ ! -L "$dest" ]
+  then
+    link_files "$source" "$dest"
+    return
+  fi
+
+  if [ "$overwrite_all" == "false" ] && [ "$backup_all" == "false" ] && [ "$skip_all" == "false" ]
+  then
+    user "File already exists: $dest, what do you want to do? [s]kip, [S]kip all, [o]verwrite, [O]verwrite all, [b]ackup, [B]ackup all?"
+    read -n 1 action
+
+    case "$action" in
+      o )
+        overwrite=true;;
+      O )
+        overwrite_all=true;;
+      b )
+        backup=true;;
+      B )
+        backup_all=true;;
+      s )
+        skip=true;;
+      S )
+        skip_all=true;;
+      * )
+        ;;
+    esac
+  fi
+
+  if [ "$overwrite" == "true" ] || [ "$overwrite_all" == "true" ]
+  then
+    rm -rf "$dest"
+    success "removed $dest"
+  fi
+
+  if [ "$backup" == "true" ] || [ "$backup_all" == "true" ]
+  then
+    mv "$dest" "$dest"\.backup
+    success "moved $dest to $dest.backup"
+  fi
+
+  if [ "$skip" == "false" ] && [ "$skip_all" == "false" ]
+  then
+    link_files "$source" "$dest"
+  else
+    success "skipped $source"
+  fi
+}
+
+# <topic>/<name>.symlink -> ~/.<name>
 install_dotfiles () {
   info 'installing dotfiles'
 
-  overwrite_all=false
-  backup_all=false
-  skip_all=false
+  local source dest
 
   for source in `find $DOTFILES_ROOT -maxdepth 2 -name \*.symlink`
   do
     dest="$HOME/.`basename \"${source%.*}\"`"
-
-    if [ -f $dest ] || [ -d $dest ]
-    then
-
-      overwrite=false
-      backup=false
-      skip=false
-
-      if [ "$overwrite_all" == "false" ] && [ "$backup_all" == "false" ] && [ "$skip_all" == "false" ]
-      then
-        user "File already exists: `basename $source`, what do you want to do? [s]kip, [S]kip all, [o]verwrite, [O]verwrite all, [b]ackup, [B]ackup all?"
-        read -n 1 action
-
-        case "$action" in
-          o )
-            overwrite=true;;
-          O )
-            overwrite_all=true;;
-          b )
-            backup=true;;
-          B )
-            backup_all=true;;
-          s )
-            skip=true;;
-          S )
-            skip_all=true;;
-          * )
-            ;;
-        esac
-      fi
-
-      if [ "$overwrite" == "true" ] || [ "$overwrite_all" == "true" ]
-      then
-        rm -rf $dest
-        success "removed $dest"
-      fi
-
-      if [ "$backup" == "true" ] || [ "$backup_all" == "true" ]
-      then
-        mv $dest $dest\.backup
-        success "moved $dest to $dest.backup"
-      fi
-
-      if [ "$skip" == "false" ] && [ "$skip_all" == "false" ]
-      then
-        link_files $source $dest
-      else
-        success "skipped $source"
-      fi
-
-    else
-      link_files $source $dest
-    fi
-
+    link_one "$source" "$dest"
   done
+
+  clear_line
 }
 
 install_dotfiles
