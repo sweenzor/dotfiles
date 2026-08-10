@@ -11,9 +11,6 @@
     branch = auto
     interactive = auto
 
-[core]
-    excludesfile = ~/.gitignore
-
 [url "git@github.com:"]
 	insteadOf = https://github.com/
 
