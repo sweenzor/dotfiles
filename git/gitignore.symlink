@@ -3,3 +3,4 @@
 *~
 *.swp
 env/
+**/.claude/settings.local.json
