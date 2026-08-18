@@ -12,9 +12,7 @@
     interactive = auto
 
 [url "git@github.com:"]
-	# pushInsteadOf, not insteadOf: fetch/clone stay on HTTPS (gh token, no
-	# 1Password prompt); only pushes go over SSH and touch the key.
-	pushInsteadOf = https://github.com/
+	insteadOf = https://github.com/
 
 [branch]
     autosetuprebase = always
@@ -24,9 +22,3 @@
 
 [init]
 	defaultBranch = main
-[credential "https://github.com"]
-	helper = 
-	helper = !/opt/homebrew/bin/gh auth git-credential
-[credential "https://gist.github.com"]
-	helper = 
-	helper = !/opt/homebrew/bin/gh auth git-credential
