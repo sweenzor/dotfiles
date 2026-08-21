@@ -195,9 +195,33 @@ install_config () {
   clear_line
 }
 
+# bin/<name> -> ~/.local/bin/<name>. bash_profile puts ~/.local/bin on PATH
+# ahead of Homebrew, so these shadow same-named binaries in every context.
+install_bin () {
+  info 'installing bin'
+
+  local root="$DOTFILES_ROOT/bin"
+  local source dest
+
+  if [ ! -d "$root" ]
+  then
+    clear_line
+    return
+  fi
+
+  for source in `find $root -type f`
+  do
+    dest="$HOME/.local/bin/`basename \"$source\"`"
+    link_one "$source" "$dest"
+  done
+
+  clear_line
+}
+
 prune_legacy_links
 install_dotfiles
 install_config
+install_bin
 
 echo ''
 echo '  All installed!'

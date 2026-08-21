@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# gws — multi-account wrapper for the Google Workspace CLI.
+#
+# Each account gets its own GOOGLE_WORKSPACE_CLI_CONFIG_DIR under
+# $GWS_ACCOUNTS_DIR so OAuth config, credentials, and token caches never mix.
+# Identity must be explicit in scripts: non-interactive callers must pass
+# --account. The gws() function in bashrc layers a sticky per-shell account
+# and --switch on top of this; every other context (zsh, sh scripts, cron,
+# tools that exec gws) gets this script, which shadows the real binary from
+# ~/.local/bin.
+#
+# Usage:
+#   gws --account <name> <gws args...>
+#   gws <gws args...>            # interactive: pick an account with fzf
+#   gws --list-accounts
+#
+# Adding an account:
+#   mkdir -p "$GWS_ACCOUNTS_DIR/<name>"
+#   gws --account <name> auth login
+
+GWS_ACCOUNTS_DIR="${GWS_ACCOUNTS_DIR:-$HOME/.config/gws/accounts}"
+
+die() {
+    echo "gws: $1" >&2
+    exit "${2:-1}"
+}
+
+# The real googleworkspace-cli binary: the next gws on PATH that isn't this
+# file (-ef follows the ~/.local/bin symlink back to the repo copy).
+real_gws() {
+    local candidate
+    while IFS= read -r candidate; do
+        [ "$candidate" -ef "$0" ] && continue
+        echo "$candidate"
+        return 0
+    done < <(type -ap gws)
+    return 1
+}
+
+list_accounts() {
+    local dir
+    shopt -s nullglob
+    for dir in "$GWS_ACCOUNTS_DIR"/*/; do
+        dir="${dir%/}"
+        echo "${dir##*/}"
+    done
+    shopt -u nullglob
+}
+
+account="" args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --list-accounts)
+            list_accounts
+            exit 0 ;;
+        --account)
+            [ -n "${2:-}" ] || die "--account requires a value" 2
+            account="$2"; shift 2 ;;
+        --switch)
+            die "--switch (sticky account) only exists in the interactive bash function; use --account <name>" 2 ;;
+        *)
+            args+=("$1"); shift ;;
+    esac
+done
+
+entries="$(list_accounts)"
+if [ -z "$entries" ]; then
+    {
+        echo "gws: no accounts configured in $GWS_ACCOUNTS_DIR"
+        echo "To set one up:"
+        echo "  mkdir -p $GWS_ACCOUNTS_DIR/<name>"
+        echo "  gws --account <name> auth login"
+    } >&2
+    exit 1
+fi
+entries_flat="$(echo "$entries" | tr '\n' ' ')"
+
+if [ -z "$account" ]; then
+    if [ ! -t 0 ]; then
+        die "non-interactive shell — use --account <name> (one of: $entries_flat)" 2
+    fi
+    command -v fzf >/dev/null 2>&1 \
+        || die "fzf not found — use --account <name> (one of: $entries_flat)" 2
+    account="$(echo "$entries" | fzf --prompt="gws account> " --height=~10)" || exit 1
+fi
+
+# Account names are directory names; refuse anything that could escape
+# $GWS_ACCOUNTS_DIR.
+[[ "$account" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid account name '$account'"
+
+config_dir="$GWS_ACCOUNTS_DIR/$account"
+if [ ! -d "$config_dir" ]; then
+    {
+        echo "gws: no config directory for account '$account' at $config_dir (one of: $entries_flat)"
+        echo "To set it up:"
+        echo "  mkdir -p $config_dir"
+        echo "  gws --account $account auth login"
+    } >&2
+    exit 1
+fi
+
+real="$(real_gws)" || die "cannot find the real gws binary on PATH"
+
+# Scrape email from auth status JSON (no jq dependency); cache per account.
+# Stale if re-logged in as a different identity — rm the .email file to refresh.
+email_cache="$config_dir/.email" email=""
+if [ -f "$email_cache" ]; then
+    IFS= read -r email < "$email_cache"
+else
+    email="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" "$real" auth status 2>/dev/null \
+             | sed -nE 's/.*"user": *"([^"]+)".*/\1/p')"
+    [ -n "$email" ] && echo "$email" > "$email_cache"
+fi
+
+printf 'Running \033[35mgws\033[0m using account \033[1m%s\033[0m\nCredentials: %s\n\n' \
+    "${email:-$account}" "${config_dir/#$HOME/~}" >&2
+
+# Strip every other identity-bearing variable the CLI honors, so a stray
+# export can't override this account's credentials.
+exec env -u GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE \
+         -u GOOGLE_WORKSPACE_CLI_TOKEN \
+         -u GOOGLE_WORKSPACE_CLI_CLIENT_ID \
+         -u GOOGLE_WORKSPACE_CLI_CLIENT_SECRET \
+         -u GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND \
+         GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir" \
+         "$real" "${args[@]}"
