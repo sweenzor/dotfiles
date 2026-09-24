@@ -34,6 +34,8 @@ REGISTRY="$CLAUDE_DIR/sessions"
 LAUNCH_DIR="${WARP_LAUNCH_DIR:-$HOME/.warp/launch_configurations}"
 LAUNCH_NAME="claude-restore"
 OPEN_CMD="${CLAUDE_RESTORE_OPEN:-open}"   # override in tests so real Warp is never touched
+WARP_DB="${WARP_DB:-$HOME/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable/warp.sqlite}"
+SQLITE="$(command -v sqlite3 || true)"
 CLUSTER_SECS=120          # records that ended within this window of the newest end = shutdown
 PRUNE_DAYS=30             # matches Claude's default transcript cleanup
 JQ="$(command -v jq || echo /opt/homebrew/bin/jq)"
@@ -97,6 +99,22 @@ proc_cwd()    { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head
 proc_children() { ps -axo pid=,ppid= | awk -v p="$1" '$2 == p { print $1 }'; }
 is_claude_args() { [[ "$1" =~ (^|/)claude([[:space:]]|$) ]]; }
 
+# The title Warp shows for a tab, if the user set one (right-click, rename).
+# Read-only, best effort, decoration only: Warp's schema is undocumented and
+# auto-generated titles are not stored, so this is often empty.
+warp_tab_title() {
+    local u="$1"
+    [ -n "$u" ] && [ -n "$SQLITE" ] && [ -f "$WARP_DB" ] || { echo ""; return 0; }
+    [[ "$u" =~ ^[0-9a-f]{32}$ ]] || { echo ""; return 0; }
+    "$SQLITE" -readonly "file:$WARP_DB?mode=ro" \
+        "select coalesce(nullif(t.custom_title,''), nullif(pl.custom_vertical_tabs_title,''), '')
+           from terminal_panes tp
+           join pane_leaves pl on pl.pane_node_id = tp.id
+           join pane_nodes  pn on pn.id = tp.id
+           join tabs        t  on t.id = pn.tab_id
+          where lower(hex(tp.uuid)) = '$u' limit 1" 2>/dev/null || true
+}
+
 # Session ids of Claude sessions running right now, from Claude's live
 # registry (one file per Claude pid, removed on exit).
 running_sids() {
@@ -113,7 +131,7 @@ running_sids() {
 # Records: one JSON file per session, written by the hook or by --seed.
 # Loaded into parallel arrays (macOS bash has no associative arrays).
 # ---------------------------------------------------------------------------
-R_SID=() R_CWD=() R_TRANSCRIPT=() R_TITLE=() R_TAB=() R_STARTED=() R_ENDED=() R_REASON=() R_SEEDED=() R_FILE=()
+R_SID=() R_CWD=() R_TRANSCRIPT=() R_TITLE=() R_TAB=() R_WTITLE=() R_STARTED=() R_ENDED=() R_REASON=() R_SEEDED=() R_FILE=()
 
 load_records() {
     local f line
@@ -129,7 +147,8 @@ load_records() {
         [ -n "$sid" ] || continue
         [ -n "$transcript" ] || transcript="$CLAUDE_DIR/projects/$(project_slug "$cwd")/$sid.jsonl"
         R_SID+=("$sid"); R_CWD+=("$cwd"); R_TRANSCRIPT+=("$transcript"); R_TITLE+=("${title:-$(basename "$cwd")}")
-        R_TAB+=("$tab"); R_STARTED+=("$started"); R_ENDED+=("$ended"); R_REASON+=("$reason"); R_SEEDED+=("$seeded"); R_FILE+=("$f")
+        R_TAB+=("$tab"); R_WTITLE+=("$(warp_tab_title "$tab")")
+        R_STARTED+=("$started"); R_ENDED+=("$ended"); R_REASON+=("$reason"); R_SEEDED+=("$seeded"); R_FILE+=("$f")
     done
 }
 
@@ -186,7 +205,7 @@ do_list() {
     local running i status tabopen e now
     running="$(running_sids)"; now="$(now_epoch)"
     [ ${#R_SID[@]} -gt 0 ] || { echo "no records in $STATE"; return 0; }
-    printf '%-24s %-40s %-9s %-8s %s\n' TITLE DIRECTORY AGE TAB STATE
+    printf '%-22s %-30s %-5s %-6s %-26s %s\n' TITLE DIRECTORY AGE TAB 'WARP TAB' STATE
     for i in "${!R_SID[@]}"; do
         if grep -qx "${R_SID[$i]}" <<<"$running"; then status="running"
         elif [ ! -f "${R_TRANSCRIPT[$i]}" ]; then status="no transcript"
@@ -197,7 +216,7 @@ do_list() {
         for s in "${!S_PID[@]}"; do [ -n "${R_TAB[$i]}" ] && [ "${S_TAB[$s]}" = "${R_TAB[$i]}" ] && tabopen=open; done
         [ -n "${R_TAB[$i]}" ] || tabopen=none
         e="$(iso_to_epoch "${R_ENDED[$i]:-${R_STARTED[$i]}}")"
-        printf '%-24.24s %-40.40s %-9s %-8s %s\n' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "$(age_str $((now - e)))" "$tabopen" "$status"
+        printf '%-22.22s %-30.30s %-5s %-6s %-26.26s %s\n' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "$(age_str $((now - e)))" "$tabopen" "${R_WTITLE[$i]}" "$status"
     done
     echo
     echo "${#S_PID[@]} registered shells:"
@@ -321,10 +340,10 @@ build_plan() {
 
 print_plan() {
     local n i j
-    printf ' %2s  %-24s %-38s %-5s %s\n' '#' TITLE DIRECTORY AGE ACTION
+    printf ' %2s  %-22s %-30s %-5s %-26s %s\n' '#' TITLE DIRECTORY AGE 'WARP TAB' ACTION
     for j in "${!P_IDX[@]}"; do
         i=${P_IDX[$j]}
-        printf ' %2d  %-24.24s %-38.38s %-5s %s\n' "$((j+1))" "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${P_ACTION[$j]}"
+        printf ' %2d  %-22.22s %-30.30s %-5s %-26.26s %s\n' "$((j+1))" "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${R_WTITLE[$i]}" "${P_ACTION[$j]}"
     done
 }
 
@@ -367,7 +386,7 @@ pick_with_fzf() {
     lines=""
     for j in "${actionable[@]}"; do
         i=${P_IDX[$j]}
-        lines+="$j"$'\t'"$(printf '%-24.24s %-38.38s %-5s %s' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${P_ACTION[$j]}")"$'\n'
+        lines+="$j"$'\t'"$(printf '%-22.22s %-30.30s %-5s %-26.26s %s' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${R_WTITLE[$i]}" "${P_ACTION[$j]}")"$'\n'
     done
     chosen="$(printf '%s' "$lines" | fzf --multi --with-nth=2.. --delimiter=$'\t' --prompt='restore> ' \
               --header='tab to mark, enter to restore, esc to quit' | cut -f1)" || { note "nothing touched"; exit 0; }

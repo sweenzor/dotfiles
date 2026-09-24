@@ -56,9 +56,9 @@ Reading the diagram: while you work, every interactive session writes a record t
 Design choices worth stating:
 
 - Tab identity comes from `WARP_TERMINAL_SESSION_UUID`, which Claude inherits and the hook records. Directory is only a fallback.
-- The shell launches Claude as a foreground child, not with `exec`, so `/exit` returns the tab to a normal prompt as usual.
+- The shell launches Claude as a foreground child, not with `exec`, so `/exit` returns the tab to a normal prompt as usual. The one exception is the tab the command is run from: there `claude-restore` replaces itself with Claude at the end, which leaves that shell waiting on Claude exactly as if it had been typed.
 - Records are deleted only on clean user exits. Anything that ended by signal, crash, or hard kill stays, because that is exactly what a shutdown looks like from inside the session.
-- No dependence on Warp's database or on Claude's undocumented registry for correctness. Both are read only to seed the initial records and to decorate titles.
+- No dependence on Warp's database or on Claude's undocumented registry for correctness. Both are read only to seed the initial records and to decorate the output with titles.
 
 ## Recording sessions
 
@@ -72,7 +72,7 @@ On **SessionStart** it:
 4. Fills the title from `session_title`, else from the derived name in Claude's live registry entry for the parent pid, else from the directory basename.
 5. Writes the record atomically (temp file, then rename), overwriting any existing record for the same session id. A resume therefore refreshes the record with the current tab.
 
-On **SessionEnd** it reads the reason. `prompt_input_exit`, `clear`, and `logout` delete the record. `other` and anything unrecognized stamp the record with `ended_at` and the reason and leave it in place.
+On **SessionEnd** it reads the reason. `prompt_input_exit`, `clear`, `logout`, and `resume` (leaving a session by resuming another from inside it) delete the record. `other` and anything unrecognized stamp the record with `ended_at` and the reason and leave it in place.
 
 Optionally the same script runs on **Stop** to refresh the title after a `/rename`. That costs one small process per turn and can be left out at first.
 
@@ -85,18 +85,22 @@ Record format:
   "transcript_path": "/Users/sweeney/.claude/projects/-Users-sweeney--dotfiles/52efb32f-....jsonl",
   "title": "dotfiles",
   "warp_tab": "0fc099e10b5e423d9e5be87736f4fb4a",
+  "source": "startup",
+  "claude_pid": 43154,
   "started_at": "2026-09-18T19:08:53Z",
   "ended_at": null,
   "end_reason": null
 }
 ```
 
+`source` is the SessionStart source (`startup`, `resume`, `clear`, `compact`, or `seed`), and `claude_pid` the Claude process that wrote it. Records written by `--seed` also carry `"seeded": true`, which is how the seed step tells its own records from the hook's.
+
 The hooks are registered in `~/.claude/settings.json`, which is not in the dotfiles repo today. The entry is small:
 
 ```json
 "hooks": {
-  "SessionStart": [{"hooks": [{"type": "command", "command": "~/.local/bin/claude-session-track"}]}],
-  "SessionEnd":   [{"hooks": [{"type": "command", "command": "~/.local/bin/claude-session-track"}]}]
+  "SessionStart": [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/claude-session-track"}]}],
+  "SessionEnd":   [{"hooks": [{"type": "command", "command": "$HOME/.local/bin/claude-session-track"}]}]
 }
 ```
 
@@ -146,13 +150,17 @@ flowchart TD
 
 **Matching.** Tab id first, exact. If the record's tab is gone, fall back to an idle registered shell in the same directory that has not already been claimed in this run. Two tabs in the same directory are therefore paired by id, and the fallback only ever fills a tab that has nothing else coming to it.
 
-**Plan and confirm.** Nothing is resumed until you approve it. Once the pairs are matched the command prints the plan — a row per record with title, directory, age, and the action it will take (resume in tab, new tab, skip and why) — and waits. Enter accepts the plan, a list of row numbers keeps only those rows, `p` hands the same list to fzf for a multi-select, and `q` exits without touching a shell. The two non-interactive flags sit either side of that prompt: `--dry-run` prints the plan and stops, `--yes` accepts it unseen. With no TTY, the command prints the plan and exits unless `--yes` is given.
+The shell the command was started from is a special case. It cannot be signaled, since it is busy running the command, so it counts as available and is handled last: once every other tab is signaled and the new tabs are open, the command execs into `claude --resume` for that tab's own session. The plan shows this as "resume here, in this tab". The command recognizes its own tab by that shell having exactly one child, so it must be run on its own, not in a pipeline.
+
+**Plan and confirm.** Nothing is resumed until you approve it. Once the pairs are matched the command prints the plan — a row per record with title, directory, age, the Warp tab title when you have set one, and the action it will take (resume in tab, new tab, skip and why) — and waits. Enter accepts the plan, a list of row numbers keeps only those rows, `p` hands the same list to fzf for a multi-select, and `q` exits without touching a shell. The two non-interactive flags sit either side of that prompt: `--dry-run` prints the plan and stops, `--yes` accepts it unseen. With no TTY, the command prints the plan and exits unless `--yes` is given.
 
 **Signaling.** For each pair the command writes the session id into the shell's assignment file, then sends SIGUSR1. It waits briefly and checks the shell now has a `claude` child. If not, it reports the tab as needing a manual `claude --resume <id>` and moves on.
 
 **Orphans.** Records with no usable shell are written into a Warp launch configuration, one tab per session with the right cwd and `claude --resume <id>`, and opened with `open "warp://launch/claude-restore"`. This path is the one verified earlier.
 
-**Output.** A table of what happened: title, directory, session id, and the action taken (resumed in tab, new tab, skipped and why).
+**Output.** A table of what happened: title, directory, and the action taken (resumed in tab, new tab, skipped and why).
+
+**Warp tab titles.** The plan and `--list` show the title of the tab a record belongs to, read from Warp's database by tab id. Warp stores only titles you set yourself (right-click a tab, rename), not the ones it generates from the running program, so the column is blank for most tabs. It is decoration: nothing depends on it, and an unreadable database just leaves it empty.
 
 Flags:
 
@@ -169,7 +177,7 @@ Flags:
 
 ## Seeding the sessions already running
 
-The 15 sessions open right now started before any hook existed, and a running session does not load a newly installed hook until it restarts. Without a seed, the first restart after install would lose all of them.
+The 13 sessions that were running when this was installed on Sep 23, 2026 started before any hook existed, and a running session does not load a newly installed hook until it restarts. Without a seed, the first restart after install would lose all of them.
 
 `claude-restore --seed` writes a record for each of them from information that is already available:
 
@@ -191,6 +199,7 @@ One run of `--seed` right after installing is the whole step. It can also be run
 | Claude crashed or was killed hard | No SessionEnd, no end stamp. The record is treated as a shutdown victim and restored. |
 | Two tabs in the same directory | Paired by tab id. If one tab is gone, only an unclaimed idle shell in that directory can take its session. |
 | The record's tab exists but is busy, or already running Claude | Skipped and listed in the summary. Nothing is signaled. |
+| The tab `claude-restore` is run from | Not busy for this purpose. Its own session is restored last, by exec, and the prompt returns when Claude exits. Run the command on its own, not in a pipeline, or that tab reads as busy. |
 | The transcript is gone (Claude's 30-day cleanup, or a session that never had a message) | Skipped, because resuming would silently start a new session. `--prune` deletes such records. |
 | A `claude -p` run from a script or a hook | Never recorded. The hook checks its parent's command line. |
 | A session started outside Warp | Recorded with no tab id. It can only match by directory or go to a new tab. |
@@ -215,9 +224,9 @@ Everything lands in the dotfiles repo and installs through the existing `script/
 | Path in repo | Purpose |
 | --- | --- |
 | `bin/claude-session-track` | Hook handler for SessionStart and SessionEnd. Bash plus `jq`. |
-| `bin/claude-restore` | The restore command, with `--seed`, `--list`, `--dry-run`, `--all`, `--pick`, `--prune`, `--focus`. Bash plus `jq`, `lsof`, `fzf`. |
+| `bin/claude-restore` | The restore command, with `--dry-run`, `--yes`, `--pick`, `--all`, `--focus`, `--list`, `--seed`, `--prune`. Bash plus `jq`, `lsof`, `fzf`. |
 | `bash/bashrc.symlink` | New block: shell registration, SIGUSR1 handler, EXIT cleanup. |
-| `config/claude/hooks.json` | The hook entries, kept in the repo as the source of truth for what goes into `~/.claude/settings.json`. |
+| `config/claude/hooks.json` | The hook entries, kept in the repo as the source of truth for what goes into `~/.claude/settings.json`. Bootstrap also links it to `~/.config/claude/hooks.json`, which nothing reads; harmless. |
 | `docs/claude-restore.md` | This design document. |
 
 State at runtime, outside the repo:
@@ -234,7 +243,7 @@ Install steps, in order (all done on Sep 23, 2026; the first real restart is sti
 1. Commit the files and run `script/bootstrap` so the two scripts are on `PATH`.
 2. Merge the hook entries into `~/.claude/settings.json`. New sessions start recording from here on.
 3. Open a new Warp tab, or `source ~/.bashrc` in existing ones, so shells register. Existing tabs that never re-source keep working, they just cannot be signaled until they restart.
-4. Run `claude-restore --seed` once to cover the 15 sessions already running.
+4. Run `claude-restore --seed` once to cover the sessions already running (13 at install time).
 5. Run `claude-restore --list` and confirm every running session shows a record with a tab id.
 
 Nothing is installed system-wide. The only dependencies are already present: `jq`, `lsof`, `fzf`, and the `claude` CLI.
@@ -246,15 +255,27 @@ Nothing changes while you work. Sessions record themselves, shells register them
 After a restart:
 
 1. Let Warp come back with its tabs, as it does today.
-2. In any tab, run `claude-restore`. It prints the plan: a row per session with title, directory, age, and the action it will take, then waits.
-3. Press Enter to accept the whole plan, type row numbers to keep only those, `p` to choose in fzf, or `q` to abort with nothing touched. Within a few seconds every chosen tab is running its old session again, with the same name in the tab title. Sessions whose tabs were gone appear in a new window.
+2. In any tab, run `claude-restore` on its own, not piped into anything. It prints the plan: a row per session with title, directory, age, the Warp tab title if you set one, and the action it will take, then waits.
+3. Press Enter to accept the whole plan, type row numbers to keep only those, `p` to choose in fzf, or `q` to abort with nothing touched. Within a few seconds every chosen tab is running its old session again, with the same name in the tab title. Sessions whose tabs were gone appear in a new window, and the tab you ran the command from picks up its own session last.
 4. If the summary lists a tab as skipped, the reason is next to it: busy, transcript missing, or no matching shell. Those few can be resumed by hand with the printed `claude --resume <id>`.
 
 Naming sessions with `claude -n <name>` or `/rename` is still worth doing. All 15 current sessions carry auto-derived names like `dotfiles-a0`, and a real name makes both the vertical tab list and the restore summary far easier to read.
 
 A later option, once the command has proven itself over a few restarts: let the bashrc pair its own shell automatically when it starts within a few minutes of boot and a shutdown-cluster record names its tab. That would make the restore fully automatic with no command at all. It is deliberately not in the first version.
 
+## Testing
+
+Both scripts take their locations from the environment, so tests never touch real state: `CLAUDE_SESSIONS_STATE` (records and shell registry), `CLAUDE_CONFIG_DIR` (Claude's registry and transcripts), `WARP_LAUNCH_DIR` (where the launch file is written), `CLAUDE_RESTORE_OPEN` (the command used for `warp://` URLs, a stub in tests), and `WARP_DB` (Warp's database, for tab titles). `CLAUDE_RESTORE_DEBUG=1` prints how each registered shell was classified.
+
+The hook handler is tested by feeding it fake payloads and checking the record: named and unnamed titles, the headless skip, end stamps kept on `other`, deletion on `prompt_input_exit`, the Stop refresh, and garbage input. That runs in under a second.
+
+The restore command is tested with real shells: expect spawns bash processes running the real bashrc block, with a stub `claude` that logs its arguments and a stub `open`, plus records covering each path (two tabs in one directory, an orphan, a stale record, a missing transcript, and the invoking tab's own session). One quirk found this way and worth remembering: macOS `pgrep` silently excludes its own ancestors, so children are listed with `ps` instead.
+
+These are manual today, kept as scratch scripts. A runner in the repo that codifies them is the obvious next step.
+
 ## Open items
+
+- [ ] A test runner in the repo for the two suites above, so they run from one command.
 
 - [ ] A real restart end to end. Every piece was tested in isolation, and both possible shutdown outcomes lead to a restore: a signal in time leaves an end stamp, a hard kill leaves none. The first actual restart is still the proof.
 - [ ] Whether Warp's restored shells reliably start in each tab's old directory. The tab id match makes this a cosmetic question, but the fallback path depends on it.
