@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+#
+# claude-restore — put Claude Code sessions back into their Warp tabs after a
+# macOS restart.
+#
+# Sessions record themselves through the claude-session-track hook. Every
+# interactive shell registers itself from bashrc and installs a SIGUSR1
+# handler that resumes whatever session it is assigned. This command joins
+# the two: it pairs each record to the tab it came from (by Warp tab id,
+# falling back to the same directory), shows the plan, and on approval asks
+# each tab's shell to run `claude --resume <id>` in place. Records whose tab
+# no longer exists open in new tabs through a Warp launch configuration.
+#
+# Usage:
+#   claude-restore              plan, confirm, restore
+#   claude-restore --dry-run    print the plan and stop
+#   claude-restore --yes        restore the whole plan without asking
+#   claude-restore --pick       choose sessions in fzf (includes older ones)
+#   claude-restore --all        include sessions that ended before shutdown
+#   claude-restore --focus      after restoring, cycle focus through the tabs
+#   claude-restore --list       show every record and its state
+#   claude-restore --seed       record sessions that are running right now
+#   claude-restore --prune      drop records with no transcript or too old
+#
+# Design: ~/.dotfiles/docs/claude-restore.md
+
+set -eo pipefail
+
+STATE="${CLAUDE_SESSIONS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-sessions}"
+SHELLS="$STATE/shells"
+ASSIGN="$STATE/assign"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+REGISTRY="$CLAUDE_DIR/sessions"
+LAUNCH_DIR="${WARP_LAUNCH_DIR:-$HOME/.warp/launch_configurations}"
+LAUNCH_NAME="claude-restore"
+OPEN_CMD="${CLAUDE_RESTORE_OPEN:-open}"   # override in tests so real Warp is never touched
+CLUSTER_SECS=120          # records that ended within this window of the newest end = shutdown
+PRUNE_DAYS=30             # matches Claude's default transcript cleanup
+JQ="$(command -v jq || echo /opt/homebrew/bin/jq)"
+
+die()  { echo "claude-restore: $*" >&2; exit 1; }
+note() { echo "$*" >&2; }
+
+usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "$0" | sed '1d;$d'; }
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+mode=restore all=false pick=false yes=false dry=false focus=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --list)  mode=list ;;
+        --seed)  mode=seed ;;
+        --prune) mode=prune ;;
+        --all)   all=true ;;
+        --pick)  pick=true; all=true ;;
+        -y|--yes)     yes=true ;;
+        -n|--dry-run) dry=true ;;
+        --focus) focus=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option '$1' (try --help)" ;;
+    esac
+    shift
+done
+
+mkdir -p "$STATE" "$SHELLS" "$ASSIGN"
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+now_epoch() { date -u +%s; }
+iso_now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+iso_to_epoch() { date -j -u -f %Y-%m-%dT%H:%M:%SZ "$1" +%s 2>/dev/null || echo 0; }
+
+age_str() {   # seconds -> 45s / 12m / 3h / 5d
+    local s=$1
+    if   [ "$s" -lt 60 ];    then echo "${s}s"
+    elif [ "$s" -lt 3600 ];  then echo "$((s/60))m"
+    elif [ "$s" -lt 86400 ]; then echo "$((s/3600))h"
+    else echo "$((s/86400))d"; fi
+}
+
+short_path() { printf '%s\n' "${1/#$HOME/~}"; }
+
+# Claude stores transcripts under a slug of the cwd: every non-alphanumeric
+# character becomes a dash.
+project_slug() { printf '%s\n' "$1" | sed -E 's/[^A-Za-z0-9]/-/g'; }
+
+# Process helpers. All read-only.
+proc_alive()  { ps -p "$1" >/dev/null 2>&1; }
+proc_comm()   { basename "$(ps -o comm= -p "$1" 2>/dev/null || true)"; }
+proc_lstart() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+proc_args()   { ps -o args= -p "$1" 2>/dev/null || true; }
+proc_cwd()    { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true; }
+# Not pgrep -P: macOS pgrep silently drops its own ancestors, and when we ask
+# about the shell we were started from, the child it should find is us.
+proc_children() { ps -axo pid=,ppid= | awk -v p="$1" '$2 == p { print $1 }'; }
+is_claude_args() { [[ "$1" =~ (^|/)claude([[:space:]]|$) ]]; }
+
+# Session ids of Claude sessions running right now, from Claude's live
+# registry (one file per Claude pid, removed on exit).
+running_sids() {
+    local f pid
+    for f in "$REGISTRY"/*.json; do
+        [ -f "$f" ] || continue
+        pid="$(basename "$f" .json)"
+        proc_alive "$pid" || continue
+        "$JQ" -r '.sessionId // empty' "$f" 2>/dev/null
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Records: one JSON file per session, written by the hook or by --seed.
+# Loaded into parallel arrays (macOS bash has no associative arrays).
+# ---------------------------------------------------------------------------
+R_SID=() R_CWD=() R_TRANSCRIPT=() R_TITLE=() R_TAB=() R_STARTED=() R_ENDED=() R_REASON=() R_SEEDED=() R_FILE=()
+
+load_records() {
+    local f line
+    for f in "$STATE"/*.json; do
+        [ -f "$f" ] || continue
+        # Fields are joined with the unit separator (0x1f): unlike a tab it is
+        # not IFS whitespace, so empty fields do not collapse when read splits.
+        line="$("$JQ" -r '[.session_id, .cwd, (.transcript_path // ""), (.title // ""), (.warp_tab // ""),
+                          (.started_at // ""), (.ended_at // ""), (.end_reason // ""), ((.seeded // false)|tostring)]
+                          | map(tostring) | join("\u001f")' "$f" 2>/dev/null)" || continue
+        [ -n "$line" ] || continue
+        IFS=$'\x1f' read -r sid cwd transcript title tab started ended reason seeded <<<"$line"
+        [ -n "$sid" ] || continue
+        [ -n "$transcript" ] || transcript="$CLAUDE_DIR/projects/$(project_slug "$cwd")/$sid.jsonl"
+        R_SID+=("$sid"); R_CWD+=("$cwd"); R_TRANSCRIPT+=("$transcript"); R_TITLE+=("${title:-$(basename "$cwd")}")
+        R_TAB+=("$tab"); R_STARTED+=("$started"); R_ENDED+=("$ended"); R_REASON+=("$reason"); R_SEEDED+=("$seeded"); R_FILE+=("$f")
+    done
+}
+
+# The newest end stamp across all records. At shutdown every session dies
+# within seconds of each other, so records within CLUSTER_SECS of this are
+# the ones that went down with the machine.
+newest_end_epoch() {
+    local i e max=0
+    for i in "${!R_SID[@]}"; do
+        [ -n "${R_ENDED[$i]}" ] || continue
+        e="$(iso_to_epoch "${R_ENDED[$i]}")"
+        [ "$e" -gt "$max" ] && max=$e
+    done
+    echo "$max"
+}
+
+# ---------------------------------------------------------------------------
+# Shells: registered by bashrc, one file per pid. Validated here so that a
+# signal only ever reaches a live, idle bash that installed the handler.
+# ---------------------------------------------------------------------------
+S_PID=() S_TAB=() S_TTY=() S_CWD=() S_STATE=()   # state: idle | self | claude | busy
+# "self" is the shell this command was started from: its only child is us, so
+# it cannot be signaled, but it can take a session by exec'ing claude at the end.
+
+load_shells() {
+    local f pid start tab tty comm kids k state cwd
+    for f in "$SHELLS"/*; do
+        [ -f "$f" ] || continue
+        pid="$(sed -n 's/^pid=//p' "$f")"; start="$(sed -n 's/^start=//p' "$f" | sed 's/^ *//;s/ *$//')"
+        tab="$(sed -n 's/^tab=//p' "$f")";  tty="$(sed -n 's/^tty=//p' "$f")"
+        # Stale: pid gone, reused by another program, or the shell exec'd into something else.
+        if [ -z "$pid" ] || ! proc_alive "$pid" || [ "$(proc_lstart "$pid")" != "$start" ] || [[ "$(proc_comm "$pid")" != *bash ]]; then
+            rm -f "$f"; continue
+        fi
+        state=idle
+        kids="$(proc_children "$pid" | tr '\n' ' ' | sed 's/ *$//')"
+        if [ "$pid" = "$PPID" ] && [ "$kids" = "$$" ]; then
+            state=self
+        elif [ -n "$kids" ]; then
+            state=busy
+            for k in $kids; do is_claude_args "$(proc_args "$k")" && { state=claude; break; }; done
+        fi
+        cwd="$(proc_cwd "$pid")"
+        [ -n "${CLAUDE_RESTORE_DEBUG:-}" ] && note "shell pid=$pid PPID=$PPID self=$$ kids=[$kids] state=$state"
+        S_PID+=("$pid"); S_TAB+=("$tab"); S_TTY+=("${tty#/dev/}"); S_CWD+=("$cwd"); S_STATE+=("$state")
+    done
+}
+
+# ---------------------------------------------------------------------------
+# --list
+# ---------------------------------------------------------------------------
+do_list() {
+    load_records; load_shells
+    local running i status tabopen e now
+    running="$(running_sids)"; now="$(now_epoch)"
+    [ ${#R_SID[@]} -gt 0 ] || { echo "no records in $STATE"; return 0; }
+    printf '%-24s %-40s %-9s %-8s %s\n' TITLE DIRECTORY AGE TAB STATE
+    for i in "${!R_SID[@]}"; do
+        if grep -qx "${R_SID[$i]}" <<<"$running"; then status="running"
+        elif [ ! -f "${R_TRANSCRIPT[$i]}" ]; then status="no transcript"
+        elif [ -n "${R_ENDED[$i]}" ]; then status="ended (${R_REASON[$i]})"
+        else status="no end stamp"; fi
+        [ "${R_SEEDED[$i]}" = true ] && status="$status, seeded"
+        tabopen=no
+        for s in "${!S_PID[@]}"; do [ -n "${R_TAB[$i]}" ] && [ "${S_TAB[$s]}" = "${R_TAB[$i]}" ] && tabopen=open; done
+        [ -n "${R_TAB[$i]}" ] || tabopen=none
+        e="$(iso_to_epoch "${R_ENDED[$i]:-${R_STARTED[$i]}}")"
+        printf '%-24.24s %-40.40s %-9s %-8s %s\n' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "$(age_str $((now - e)))" "$tabopen" "$status"
+    done
+    echo
+    echo "${#S_PID[@]} registered shells:"
+    for s in "${!S_PID[@]}"; do
+        printf '  pid %-6s %-8s %-6s %s\n' "${S_PID[$s]}" "${S_TTY[$s]}" "${S_STATE[$s]}" "$(short_path "${S_CWD[$s]}")"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# --seed: records for sessions running right now, which started before the
+# hook existed. Reads Claude's registry and each process's environment.
+# ---------------------------------------------------------------------------
+do_seed() {
+    local f pid sid cwd name kind started tab transcript rec n=0 skipped=0
+    for f in "$REGISTRY"/*.json; do
+        [ -f "$f" ] || continue
+        pid="$(basename "$f" .json)"
+        proc_alive "$pid" || continue
+        kind="$("$JQ" -r '.kind // ""' "$f")"; [ "$kind" = interactive ] || continue
+        sid="$("$JQ" -r '.sessionId // empty' "$f")"; [ -n "$sid" ] || continue
+        cwd="$("$JQ" -r '.cwd // empty' "$f")"
+        name="$("$JQ" -r '.name // empty' "$f")"
+        started="$("$JQ" -r '(.startedAt // 0) / 1000 | floor' "$f")"
+        rec="$STATE/$sid.json"
+        if [ -f "$rec" ] && [ "$("$JQ" -r '.seeded // false' "$rec")" != true ]; then
+            skipped=$((skipped+1)); continue        # written by the hook: leave it
+        fi
+        tab="$(ps -Eww -o command= -p "$pid" 2>/dev/null | grep -oE 'WARP_TERMINAL_SESSION_UUID=[0-9a-f]+' | head -1 | cut -d= -f2 || true)"
+        transcript="$CLAUDE_DIR/projects/$(project_slug "$cwd")/$sid.jsonl"
+        "$JQ" -n --arg sid "$sid" --arg cwd "$cwd" --arg transcript "$transcript" \
+              --arg title "${name:-$(basename "$cwd")}" --arg tab "$tab" --arg pid "$pid" \
+              --arg started "$(date -u -r "$started" +%Y-%m-%dT%H:%M:%SZ)" \
+              '{session_id:$sid, cwd:$cwd, transcript_path:$transcript, title:$title,
+                warp_tab:(if $tab=="" then null else $tab end), source:"seed",
+                claude_pid:($pid|tonumber), started_at:$started, ended_at:null, end_reason:null, seeded:true}' \
+              > "$rec.tmp.$$" && mv -f "$rec.tmp.$$" "$rec"
+        n=$((n+1))
+        printf '  %-28.28s %-44.44s tab=%s\n' "${name:-$(basename "$cwd")}" "$(short_path "$cwd")" "${tab:-none}"
+    done
+    echo "seeded $n record(s); left $skipped hook-written record(s) alone"
+}
+
+# ---------------------------------------------------------------------------
+# --prune
+# ---------------------------------------------------------------------------
+do_prune() {
+    load_records
+    local i now e n=0
+    now="$(now_epoch)"
+    for i in "${!R_SID[@]}"; do
+        if [ ! -f "${R_TRANSCRIPT[$i]}" ]; then
+            echo "  drop ${R_TITLE[$i]} (no transcript)"; rm -f "${R_FILE[$i]}"; n=$((n+1))
+        elif [ -n "${R_ENDED[$i]}" ]; then
+            e="$(iso_to_epoch "${R_ENDED[$i]}")"
+            if [ $((now - e)) -gt $((PRUNE_DAYS*86400)) ]; then
+                echo "  drop ${R_TITLE[$i]} (ended $(age_str $((now - e))) ago)"; rm -f "${R_FILE[$i]}"; n=$((n+1))
+            fi
+        fi
+    done
+    echo "pruned $n record(s)"
+}
+
+# ---------------------------------------------------------------------------
+# Restore: build the plan
+# ---------------------------------------------------------------------------
+P_IDX=() P_KIND=() P_PID=() P_ACTION=() P_AGE=()     # kind: tab | self | newtab | skip
+CLAIMED=()                                            # shell indexes already given a session
+
+shell_claimed() { local s; for s in "${CLAIMED[@]:-}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
+
+build_plan() {
+    local running newest now i e s found reason
+    running="$(running_sids)"; now="$(now_epoch)"; newest="$(newest_end_epoch)"
+    for i in "${!R_SID[@]}"; do
+        e="$(iso_to_epoch "${R_ENDED[$i]:-${R_STARTED[$i]}}")"
+        P_IDX+=("$i"); P_AGE+=("$(age_str $((now - e)))"); P_PID+=("")
+        if grep -qx "${R_SID[$i]}" <<<"$running"; then
+            P_KIND+=(skip); P_ACTION+=("skip: already running"); continue
+        fi
+        if [ ! -f "${R_TRANSCRIPT[$i]}" ]; then
+            P_KIND+=(skip); P_ACTION+=("skip: transcript missing"); continue
+        fi
+        if [ -n "${R_ENDED[$i]}" ] && [ "$all" = false ] && [ $((newest - e)) -gt "$CLUSTER_SECS" ]; then
+            P_KIND+=(skip); P_ACTION+=("skip: ended $(age_str $((newest - e))) before shutdown (--all to include)"); continue
+        fi
+        # 1. exact tab
+        found=""
+        if [ -n "${R_TAB[$i]}" ]; then
+            for s in "${!S_PID[@]}"; do
+                [ "${S_TAB[$s]}" = "${R_TAB[$i]}" ] || continue
+                if [ "${S_STATE[$s]}" != idle ] && [ "${S_STATE[$s]}" != self ]; then
+                    P_KIND+=(skip); P_ACTION+=("skip: its tab ${S_TTY[$s]} is ${S_STATE[$s]/claude/running claude}"); found=skip; break
+                fi
+                shell_claimed "$s" && continue
+                found=$s; break
+            done
+            [ "$found" = skip ] && continue
+        fi
+        # 2. same directory, idle, unclaimed
+        if [ -z "$found" ]; then
+            for s in "${!S_PID[@]}"; do
+                [ "${S_STATE[$s]}" = idle ] || [ "${S_STATE[$s]}" = self ] || continue
+                [ "${S_CWD[$s]}" = "${R_CWD[$i]}" ] || continue
+                shell_claimed "$s" && continue
+                found=$s; reason=" (by directory)"; break
+            done
+        else
+            reason=""
+        fi
+        if [ -n "$found" ] && [ "${S_STATE[$found]}" = self ]; then
+            CLAIMED+=("$found"); P_PID[${#P_PID[@]}-1]="${S_PID[$found]}"
+            P_KIND+=(self); P_ACTION+=("resume here, in this tab$reason")
+        elif [ -n "$found" ]; then
+            CLAIMED+=("$found"); P_PID[${#P_PID[@]}-1]="${S_PID[$found]}"
+            P_KIND+=(tab); P_ACTION+=("resume in tab ${S_TTY[$found]}$reason")
+        else
+            P_KIND+=(newtab); P_ACTION+=("open new tab")
+        fi
+    done
+}
+
+print_plan() {
+    local n i j
+    printf ' %2s  %-24s %-38s %-5s %s\n' '#' TITLE DIRECTORY AGE ACTION
+    for j in "${!P_IDX[@]}"; do
+        i=${P_IDX[$j]}
+        printf ' %2d  %-24.24s %-38.38s %-5s %s\n' "$((j+1))" "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${P_ACTION[$j]}"
+    done
+}
+
+# Selected plan rows (0-based indexes into P_*), one per line.
+SELECTED=()
+
+select_rows() {
+    local j ans nums
+    actionable=()
+    for j in "${!P_IDX[@]}"; do [ "${P_KIND[$j]}" != skip ] && actionable+=("$j"); done
+    if [ ${#actionable[@]} -eq 0 ]; then note "nothing to restore"; exit 0; fi
+
+    if [ "$pick" = true ]; then
+        pick_with_fzf; return
+    fi
+    if [ "$yes" = true ]; then SELECTED=("${actionable[@]}"); return; fi
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        note "no terminal to confirm on: rerun with --yes to apply this plan"; exit 2
+    fi
+    echo
+    read -r -p "[Enter] restore all ${#actionable[@]} · row numbers to narrow (e.g. 1 3) · p pick with fzf · q quit > " ans
+    case "$ans" in
+        "")   SELECTED=("${actionable[@]}") ;;
+        q|Q)  note "nothing touched"; exit 0 ;;
+        p|P)  pick_with_fzf ;;
+        *)
+            for n in $ans; do
+                [[ "$n" =~ ^[0-9]+$ ]] || die "not a row number: $n"
+                j=$((n-1))
+                [ "$j" -ge 0 ] && [ "$j" -lt ${#P_IDX[@]} ] || die "no row $n"
+                [ "${P_KIND[$j]}" != skip ] || die "row $n is skipped: ${P_ACTION[$j]}"
+                SELECTED+=("$j")
+            done ;;
+    esac
+}
+
+pick_with_fzf() {
+    command -v fzf >/dev/null || die "fzf not found"
+    local j i lines chosen
+    lines=""
+    for j in "${actionable[@]}"; do
+        i=${P_IDX[$j]}
+        lines+="$j"$'\t'"$(printf '%-24.24s %-38.38s %-5s %s' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "${P_AGE[$j]}" "${P_ACTION[$j]}")"$'\n'
+    done
+    chosen="$(printf '%s' "$lines" | fzf --multi --with-nth=2.. --delimiter=$'\t' --prompt='restore> ' \
+              --header='tab to mark, enter to restore, esc to quit' | cut -f1)" || { note "nothing touched"; exit 0; }
+    [ -n "$chosen" ] || { note "nothing touched"; exit 0; }
+    while read -r j; do SELECTED+=("$j"); done <<<"$chosen"
+}
+
+# ---------------------------------------------------------------------------
+# Restore: act on the selection
+# ---------------------------------------------------------------------------
+yaml_q() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+
+write_launch_config() {   # args: plan row indexes of kind newtab
+    local j i
+    mkdir -p "$LAUNCH_DIR"
+    {
+        echo '---'
+        echo "name: $LAUNCH_NAME"
+        echo 'windows:'
+        echo '  - tabs:'
+        for j in "$@"; do
+            i=${P_IDX[$j]}
+            echo "      - title: $(yaml_q "${R_TITLE[$i]}")"
+            echo '        layout:'
+            echo "          cwd: $(yaml_q "${R_CWD[$i]}")"
+            echo '          commands:'
+            echo "            - exec: claude --resume ${R_SID[$i]}"
+        done
+    } > "$LAUNCH_DIR/$LAUNCH_NAME.yaml"
+}
+
+do_restore() {
+    load_records; load_shells; build_plan
+    [ ${#P_IDX[@]} -gt 0 ] || { echo "no records in $STATE (run --seed while sessions are up)"; exit 0; }
+    print_plan
+    [ "$dry" = true ] && exit 0
+    select_rows
+
+    local j i pid tabs=() newtabs=() results=() self=""
+    for j in "${SELECTED[@]}"; do
+        case "${P_KIND[$j]}" in tab) tabs+=("$j") ;; newtab) newtabs+=("$j") ;; self) self="$j" ;; esac
+    done
+
+    # In-tab resumes: hand the shell its session id, then signal it. The
+    # shell's own handler does the launch, so only registered, verified,
+    # idle bash processes are ever signaled (see load_shells).
+    for j in "${tabs[@]:-}"; do
+        [ -n "$j" ] || continue
+        i=${P_IDX[$j]}; pid=${P_PID[$j]}
+        printf '%s\n' "${R_SID[$i]}" > "$ASSIGN/$pid"
+        kill -USR1 "$pid" 2>/dev/null || { rm -f "$ASSIGN/$pid"; results+=("$j"$'\t'"failed: shell $pid gone"); continue; }
+        results+=("$j"$'\t'"signaled")
+    done
+
+    if [ ${#newtabs[@]} -gt 0 ]; then
+        write_launch_config "${newtabs[@]}"
+        "$OPEN_CMD" "warp://launch/$LAUNCH_NAME" && for j in "${newtabs[@]}"; do results+=("$j"$'\t'"opened in new tab"); done
+    fi
+
+    # Give the shells a moment, then check each one actually started Claude.
+    if [ ${#tabs[@]} -gt 0 ] && [ -n "${tabs[0]}" ]; then
+        sleep 2
+        local k r ok
+        for k in "${!results[@]}"; do
+            IFS=$'\t' read -r j r <<<"${results[$k]}"
+            [ "$r" = signaled ] || continue
+            i=${P_IDX[$j]}; pid=${P_PID[$j]}; ok=false
+            for c in $(proc_children "$pid"); do is_claude_args "$(proc_args "$c")" && ok=true; done
+            if [ "$ok" = true ]; then results[$k]="$j"$'\t'"resumed in tab"
+            else rm -f "$ASSIGN/$pid"; results[$k]="$j"$'\t'"not started; run by hand: claude --resume ${R_SID[$i]}"; fi
+        done
+    fi
+
+    echo
+    for r in "${results[@]}"; do
+        IFS=$'\t' read -r j msg <<<"$r"; i=${P_IDX[$j]}
+        printf '  %-24.24s %-38.38s %s\n' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "$msg"
+    done
+
+    if [ "$focus" = true ]; then
+        for j in "${tabs[@]:-}"; do
+            [ -n "$j" ] || continue
+            i=${P_IDX[$j]}; [ -n "${R_TAB[$i]}" ] || continue
+            "$OPEN_CMD" "warp://session/${R_TAB[$i]}" 2>/dev/null || true; sleep 0.4
+        done
+    fi
+
+    # This tab's own session goes last: replace this process with Claude so
+    # the shell we came from is left waiting on it, exactly as if typed.
+    if [ -n "$self" ]; then
+        i=${P_IDX[$self]}
+        printf '  %-24.24s %-38.38s %s\n' "${R_TITLE[$i]}" "$(short_path "${R_CWD[$i]}")" "resuming here now"
+        exec claude --resume "${R_SID[$i]}"
+    fi
+}
+
+case "$mode" in
+    list)    do_list ;;
+    seed)    do_seed ;;
+    prune)   do_prune ;;
+    restore) do_restore ;;
+esac

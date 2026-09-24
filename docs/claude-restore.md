@@ -179,6 +179,8 @@ The 15 sessions open right now started before any hook existed, and a running se
 
 The seed never overwrites a record the hooks have already written, so it is safe to rerun. Once a seeded session restarts through the hooks, the hook record takes over.
 
+One limitation until then: a seeded session is not hook-tracked, so exiting it by hand before the first restart leaves its record with no end stamp, and it will show up in the next plan once. It is one row to drop at the prompt, and the record is replaced the moment the session is resumed through the hooks.
+
 One run of `--seed` right after installing is the whole step. It can also be run any time as a belt-and-braces check that every running session has a record.
 
 ## Edge cases and safety guards
@@ -227,7 +229,7 @@ State at runtime, outside the repo:
 | `~/.local/state/claude-sessions/assign/<pid>` | Pending assignment for a shell, deleted by its handler. |
 | `~/.warp/launch_configurations/claude-restore.yaml` | Regenerated on each run that needs new tabs. |
 
-Install steps, in order:
+Install steps, in order (all done on Sep 23, 2026; the first real restart is still pending):
 
 1. Commit the files and run `script/bootstrap` so the two scripts are on `PATH`.
 2. Merge the hook entries into `~/.claude/settings.json`. New sessions start recording from here on.

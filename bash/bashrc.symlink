@@ -74,6 +74,28 @@ gws() {
     "$script" --account "$GWS_ACCOUNT" "${args[@]}"
 }
 
+# Claude session restore (docs/claude-restore.md). Register this shell so
+# `claude-restore` can pair it with the Claude session that ran in this Warp
+# tab before a restart, and install the handler it uses to ask for the
+# resume. Only interactive shells with a terminal take part.
+if [[ $- == *i* ]] && [ -t 0 ]; then
+    __claude_state="${CLAUDE_SESSIONS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-sessions}"
+    mkdir -p "$__claude_state/shells" "$__claude_state/assign" 2>/dev/null
+    printf 'pid=%s\nstart=%s\ntab=%s\ntty=%s\n' "$$" "$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')" \
+        "${WARP_TERMINAL_SESSION_UUID:-}" "$(tty)" > "$__claude_state/shells/$$" 2>/dev/null
+    # SIGUSR1: resume the session named in this shell's assignment file, in
+    # the foreground, so the prompt comes back when Claude exits.
+    __claude_resume_assigned() {
+        local f="$__claude_state/assign/$$" sid
+        [ -f "$f" ] || return 0
+        sid="$(<"$f")"; rm -f "$f"
+        [[ "$sid" =~ ^[0-9a-f-]{36}$ ]] || return 0
+        claude --resume "$sid"
+    }
+    trap __claude_resume_assigned USR1
+    trap 'rm -f "$__claude_state/shells/$$"' EXIT
+fi
+
 # OrbStack (no admin helper)
 export PATH="$HOME/.orbstack/bin:$PATH"
 export DOCKER_HOST="unix://$HOME/.orbstack/run/docker.sock"

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# claude-session-track — Claude Code hook that records interactive sessions
+# so claude-restore can put them back into their Warp tabs after a restart.
+#
+# Wired for SessionStart and SessionEnd (optionally Stop) in
+# ~/.claude/settings.json; the entries live in config/claude/hooks.json.
+# Claude passes the event payload as JSON on stdin. One record per session:
+#
+#   $STATE/<session_id>.json
+#
+# SessionStart  writes or refreshes the record (skipping headless `claude -p`
+#               runs, which are detected from the parent's command line).
+# SessionEnd    deletes the record on a deliberate exit (prompt_input_exit,
+#               clear, logout, resume) and otherwise stamps ended_at, so a
+#               session killed by a shutdown is still there afterwards.
+# Stop          refreshes the title from Claude's live registry (for /rename).
+#
+# Design: ~/.dotfiles/docs/claude-restore.md
+
+set -euo pipefail
+
+STATE="${CLAUDE_SESSIONS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-sessions}"
+REGISTRY="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+JQ="$(command -v jq || echo /opt/homebrew/bin/jq)"
+
+# Hooks must never break the session: any failure exits quietly.
+trap 'exit 0' ERR
+
+payload="$(cat)"
+event="$("$JQ" -r '.hook_event_name // empty' <<<"$payload" 2>/dev/null)"
+sid="$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null)"
+[ -n "$sid" ] || exit 0
+
+mkdir -p "$STATE"
+rec="$STATE/$sid.json"
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# The hook's parent is the Claude process itself. Its command line tells a
+# headless print run from an interactive session. Only a parent whose argv0
+# is claude is inspected, so an unrelated parent can never trip this.
+parent_is_headless() {
+    local args
+    args="$(ps -o args= -p "$PPID" 2>/dev/null || true)"
+    [[ "$args" =~ ^([^[:space:]]*/)?claude([[:space:]]|$) ]] || return 1
+    [[ " $args" =~ [[:space:]](-p|--print)([[:space:]]|$) ]]
+}
+
+# Claude's live registry, keyed by the Claude pid, carries the derived name
+# for sessions that were never given one. Undocumented; best effort only.
+registry_name() {
+    local f="$REGISTRY/$PPID.json"
+    [ -f "$f" ] && "$JQ" -r '.name // empty' "$f" 2>/dev/null || true
+}
+
+write_atomic() {
+    local tmp="$rec.tmp.$$"
+    cat > "$tmp" && mv -f "$tmp" "$rec"
+}
+
+case "$event" in
+SessionStart)
+    parent_is_headless && exit 0
+
+    cwd="$("$JQ" -r '.cwd // empty' <<<"$payload")"
+    title="$("$JQ" -r '.session_title // empty' <<<"$payload")"
+    [ -n "$title" ] || title="$(registry_name)"
+    [ -n "$title" ] || title="$(basename "${cwd:-/}")"
+
+    "$JQ" -n \
+        --arg sid "$sid" \
+        --arg cwd "$cwd" \
+        --arg transcript "$("$JQ" -r '.transcript_path // empty' <<<"$payload")" \
+        --arg title "$title" \
+        --arg tab "${WARP_TERMINAL_SESSION_UUID:-}" \
+        --arg source "$("$JQ" -r '.source // empty' <<<"$payload")" \
+        --arg claude_pid "$PPID" \
+        --arg now "$now" \
+        '{
+            session_id: $sid,
+            cwd: $cwd,
+            transcript_path: $transcript,
+            title: $title,
+            warp_tab: (if $tab == "" then null else $tab end),
+            source: $source,
+            claude_pid: ($claude_pid | tonumber),
+            started_at: $now,
+            ended_at: null,
+            end_reason: null
+        }' | write_atomic
+    ;;
+
+SessionEnd)
+    reason="$("$JQ" -r '.reason // "other"' <<<"$payload")"
+    case "$reason" in
+        prompt_input_exit|clear|logout|resume)
+            rm -f "$rec"
+            ;;
+        *)
+            [ -f "$rec" ] || exit 0
+            "$JQ" --arg now "$now" --arg reason "$reason" \
+                '.ended_at = $now | .end_reason = $reason' "$rec" | write_atomic
+            ;;
+    esac
+    ;;
+
+Stop)
+    [ -f "$rec" ] || exit 0
+    name="$(registry_name)"
+    [ -n "$name" ] || exit 0
+    "$JQ" --arg title "$name" 'if .title != $title then .title = $title else . end' "$rec" | write_atomic
+    ;;
+esac
+
+exit 0
