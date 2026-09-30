@@ -207,6 +207,7 @@ One run of `--seed` right after installing is the whole step. It can also be run
 | Resuming a session in a different tab than it came from | The resume's SessionStart rewrites the record with the new tab id. |
 | A pid in the shell registry was reused by another process | The registry stores the process start time; a mismatch means the entry is stale and is ignored and removed. |
 | `claude-restore` run twice | The second run finds every session already running and does nothing. |
+| The folder has no trust flag in `~/.claude.json` | `claude --resume` stops at Claude's "Quick safety check" dialog, one keypress. Trust is keyed on the git root or the exact folder, and Claude never persists it for the home directory, so sessions started in `~` ask on every launch. Verified Sep 30, 2026. The script does not pre-seed the flag; the decision was to stop running sessions in `~` instead. |
 
 Signal safety is the one place a bug could hurt, since SIGUSR1 kills a process that has no handler. The rules, all enforced before any signal is sent:
 
